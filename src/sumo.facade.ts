@@ -240,11 +240,12 @@ export function crypto_scalarmult(
   }
 
   // Clamp the private key as per X25519 specification
-  privateKey[0] &= 248;
-  privateKey[31] &= 127;
-  privateKey[31] |= 64;
+  const clampedKey = new Uint8Array(privateKey);
+  clampedKey[0] &= 248;
+  clampedKey[31] &= 127;
+  clampedKey[31] |= 64;
 
-  return x25519.getSharedSecret(privateKey, publicKey);
+  return x25519.getSharedSecret(clampedKey, publicKey);
 }
 
 /**
