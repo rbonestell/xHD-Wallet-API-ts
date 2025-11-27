@@ -26,8 +26,14 @@ export interface CryptoKX {
 
 const crypto_sign_SECRETKEYBYTES = 64;
 const crypto_scalarmult_ed25519_SCALARBYTES = 32;
+const crypto_scalarmult_x25519_SCALARBYTES = 32;
+const crypto_scalarmult_x25519_PKBYTES = 32;
 const crypto_generichash_BYTES_MIN = 16;
 const crypto_generichash_BYTES_MAX = 64;
+const crypto_generichash_blake2b_BYTES_MAX = 64;
+const crypto_core_ed25519_NONREDUCEDSCALARBYTES = 64;
+const crypto_kx_SESSIONKEYBYTES = 32;
+const crypto_kx_PUBLICKEYBYTES = 32;
 
 // ===========================
 // Ed25519 Signature Functions
@@ -87,34 +93,24 @@ export function crypto_scalarmult_ed25519_base_noclamp(
   // Convert scalar bytes to bigint (little-endian)
   const scalarBigint = bytesToNumberLE(scalar);
 
+  // Always clear top bit and call reduce modulo curve order, for constant time.
+  // This maintains compatibility with libsodium's noclamp behavior
+
+  // Clear top bit from scalar using bitwise AND with bitmask:
+  // 1n << 255n creates a bigint with only bit 255 set
+  // Subtracting 1n gives you all bits 0-254 set (0x7FFF...FFFF)
+  // Bitwise & operation with the resulting mask clears bit 255
+  const clearedTopBitScalar = scalarBigint & ((1n << 255n) - 1n);
+  const reducedScalar = mod(clearedTopBitScalar, ed25519.Point.Fn.ORDER);
+
   // Reject zero scalars to match libsodium behavior
-  if (scalarBigint === 0n) {
+  if (reducedScalar === 0n) {
     throw new Error("scalar is 0");
   }
 
-  try {
-    // Try multiplication directly
-    const point = ed25519.Point.BASE.multiply(scalarBigint);
-    return point.toBytes();
-  } catch (error) {
-    // For edge cases (scalar >= curve order), reduce modulo curve order
-    // This maintains compatibility with libsodium's noclamp behavior
-
-    // Clear top bit from scalar using bitwise AND with bitmask:
-    // 1n << 255n creates a bigint with only bit 255 set
-    // Subtracting 1n gives you all bits 0-254 set (0x7FFF...FFFF)
-    // Bitwise & operation with the resulting mask clears bit 255
-    const clearedTopBitScalar = scalarBigint & ((1n << 255n) - 1n);
-    const reducedScalar = mod(clearedTopBitScalar, ed25519.Point.Fn.ORDER);
-
-    // Reject zero after reduction
-    if (reducedScalar === 0n) {
-      throw new Error("scalar is 0");
-    }
-
-    const point = ed25519.Point.BASE.multiply(reducedScalar);
-    return point.toBytes();
-  }
+  // Perform scalar multiplication with base point
+  const point = ed25519.Point.BASE.multiply(reducedScalar);
+  return point.toBytes();
 }
 
 /**
@@ -145,14 +141,35 @@ export function crypto_core_ed25519_scalar_add(
   scalarA: Uint8Array,
   scalarB: Uint8Array
 ): Uint8Array {
+  // Input validation - ensure both scalars are correct length
+  if (scalarA.length !== crypto_scalarmult_ed25519_SCALARBYTES ||
+    scalarB.length !== crypto_scalarmult_ed25519_SCALARBYTES) {
+    throw new Error(
+      `scalars must be ${crypto_scalarmult_ed25519_SCALARBYTES} bytes`
+    );
+  }
 
   // Convert little-endian bytes to bigint
   const a = bytesToNumberLE(scalarA);
   const b = bytesToNumberLE(scalarB);
-  const result = mod(a + b, ed25519.Point.Fn.ORDER);
+  const sum = a + b;
 
-  // Convert back to little-endian bytes
-  return numberToBytesLE(result, 32);
+  // Safety check: ensure sum fits into 64 bytes maximum. If
+  // bytesToNumberLE ever misbehaves and returns something larger,
+  // this will catch it before we try to serialize.
+  if (sum < 0n || sum > (1n << (64n * 8n)) - 1n) {
+    throw new Error("resulting sum scalar is invalid");
+  }
+
+  const reduced = mod(sum, ed25519.Point.Fn.ORDER);
+  const result = numberToBytesLE(reduced, crypto_scalarmult_ed25519_SCALARBYTES);
+
+  // Final length check
+  if (result.length !== crypto_scalarmult_ed25519_SCALARBYTES) {
+    throw new Error("resulting scalar has invalid length");
+  }
+
+  return result
 }
 
 /**
@@ -163,11 +180,25 @@ export function crypto_core_ed25519_scalar_mul(
   scalarB: Uint8Array
 ): Uint8Array {
 
+  // Input validation - ensure both scalars are correct length
+  if (scalarA.length !== crypto_scalarmult_ed25519_SCALARBYTES ||
+    scalarB.length !== crypto_scalarmult_ed25519_SCALARBYTES) {
+    throw new Error(
+      `scalars must be ${crypto_scalarmult_ed25519_SCALARBYTES} bytes`
+    );
+  }
+
   const a = bytesToNumberLE(scalarA);
   const b = bytesToNumberLE(scalarB);
-  const result = mod(a * b, ed25519.Point.Fn.ORDER);
+  const reduced = mod(a * b, ed25519.Point.Fn.ORDER);
+  const result = numberToBytesLE(reduced, crypto_scalarmult_ed25519_SCALARBYTES);
 
-  return numberToBytesLE(result, 32);
+  // Final length check
+  if (result.length !== crypto_scalarmult_ed25519_SCALARBYTES) {
+    throw new Error("resulting scalar has invalid length");
+  }
+
+  return result;
 }
 
 /**
@@ -176,13 +207,21 @@ export function crypto_core_ed25519_scalar_mul(
 export function crypto_core_ed25519_scalar_reduce(
   scalar: Uint8Array
 ): Uint8Array {
-  // crypto_core_ed25519_scalar_reduce can handle inputs of any size, commonly 64 bytes from hash output
-  // No length validation needed, matches libsodium behavior
+  if (scalar.length > crypto_core_ed25519_NONREDUCEDSCALARBYTES) {
+    throw new Error(`scalar must be at most ${crypto_core_ed25519_NONREDUCEDSCALARBYTES} bytes`);
+  }
 
   const scalarNum = bytesToNumberLE(scalar);
-  const result = mod(scalarNum, ed25519.Point.Fn.ORDER);
+  const reduced = mod(scalarNum, ed25519.Point.Fn.ORDER);
 
-  return numberToBytesLE(result, 32);
+  const result = numberToBytesLE(reduced, crypto_scalarmult_ed25519_SCALARBYTES);
+
+  // Final length check
+  if (result.length !== crypto_scalarmult_ed25519_SCALARBYTES) {
+    throw new Error("resulting scalar has invalid length");
+  }
+
+  return result;
 }
 
 // ===========================
@@ -196,6 +235,15 @@ export function crypto_scalarmult(
   privateKey: Uint8Array,
   publicKey: Uint8Array
 ): Uint8Array {
+  if (privateKey.length !== crypto_scalarmult_x25519_SCALARBYTES || publicKey.length !== crypto_scalarmult_x25519_PKBYTES) {
+    throw new Error("x25519 private and public keys must be 32 bytes each");
+  }
+
+  // Clamp the private key as per X25519 specification
+  privateKey[0] &= 248;
+  privateKey[31] &= 127;
+  privateKey[31] |= 64;
+
   return x25519.getSharedSecret(privateKey, publicKey);
 }
 
@@ -215,7 +263,7 @@ export function crypto_sign_ed25519_sk_to_curve25519(
   edPrivKey: Uint8Array
 ): Uint8Array {
   // Extract just the seed (first 32 bytes) since edwardsToMontgomeryPriv expects 32 bytes
-  const seed = edPrivKey.slice(0, 32);
+  const seed = edPrivKey.slice(0, crypto_scalarmult_ed25519_SCALARBYTES);
   return ed25519.utils.toMontgomerySecret(seed);
 }
 
@@ -269,21 +317,27 @@ export function crypto_kx_client_session_keys(
 ): CryptoKX {
 
   // Step 1: Perform X25519 ECDH to get shared secret
-  const sharedSecret = x25519.getSharedSecret(clientPriv, serverPub);
+  // Calling crypto_scalarmult rather than x25519.getSharedSecret to match facade function naming
+  // as crypto_scalarmult handles clamping
+  const sharedSecret = crypto_scalarmult(clientPriv, serverPub);
+
+  if (sharedSecret.length !== crypto_kx_SESSIONKEYBYTES) {
+    throw new Error(`shared secret must be ${crypto_kx_SESSIONKEYBYTES} bytes`);
+  }
 
   // Step 2: Create key material = shared_secret + client_pk + server_pk (96 bytes)
   // This matches libsodium's exact concatenation order
-  const keyMaterial = new Uint8Array(96);
+  const keyMaterial = new Uint8Array(crypto_kx_SESSIONKEYBYTES + 2 * crypto_kx_PUBLICKEYBYTES);
   keyMaterial.set(sharedSecret, 0); // shared_secret (32 bytes)
-  keyMaterial.set(clientPub, 32); // client_pk (32 bytes)
-  keyMaterial.set(serverPub, 64); // server_pk (32 bytes)
+  keyMaterial.set(clientPub, crypto_kx_PUBLICKEYBYTES); // client_pk (32 bytes)
+  keyMaterial.set(serverPub, 2 * crypto_kx_PUBLICKEYBYTES); // server_pk (32 bytes)
 
   // Step 3: BLAKE2B-512 hash to get 64-byte result
-  const hash = blake2b(keyMaterial, { dkLen: 64 });
+  const hash = crypto_generichash(crypto_generichash_blake2b_BYTES_MAX, keyMaterial);
 
   // Step 4: Split into rx (first 32 bytes) and tx (last 32 bytes) for client
-  const sharedRx = hash.slice(0, 32);
-  const sharedTx = hash.slice(32, 64);
+  const sharedRx = hash.slice(0, crypto_kx_SESSIONKEYBYTES);
+  const sharedTx = hash.slice(crypto_kx_SESSIONKEYBYTES, 2 * crypto_kx_SESSIONKEYBYTES);
 
   return {
     sharedRx: sharedRx,
@@ -301,21 +355,23 @@ export function crypto_kx_server_session_keys(
 ): CryptoKX {
 
   // Step 1: Perform X25519 ECDH to get shared secret
-  const sharedSecret = x25519.getSharedSecret(serverPriv, clientPub);
+  // Calling crypto_scalarmult rather than x25519.getSharedSecret to match facade function naming
+  // and as crypto_scalarmult handles clamping
+  const sharedSecret = crypto_scalarmult(serverPriv, clientPub);
 
   // Step 2: Create key material = shared_secret + client_pk + server_pk (96 bytes)
   // Same concatenation order as client (libsodium specification)
-  const keyMaterial = new Uint8Array(96);
+  const keyMaterial = new Uint8Array(crypto_kx_SESSIONKEYBYTES + 2 * crypto_kx_PUBLICKEYBYTES);
   keyMaterial.set(sharedSecret, 0); // shared_secret (32 bytes)
-  keyMaterial.set(clientPub, 32); // client_pk (32 bytes)
-  keyMaterial.set(serverPub, 64); // server_pk (32 bytes)
+  keyMaterial.set(clientPub, crypto_kx_PUBLICKEYBYTES); // client_pk (32 bytes)
+  keyMaterial.set(serverPub, 2 * crypto_kx_PUBLICKEYBYTES); // server_pk (32 bytes)
 
   // Step 3: BLAKE2B-512 hash to get 64-byte result
-  const hash = blake2b(keyMaterial, { dkLen: 64 });
+  const hash = crypto_generichash(crypto_generichash_blake2b_BYTES_MAX, keyMaterial);
 
   // Step 5: Server swaps rx/tx (server rx = client tx, server tx = client rx)
-  const sharedRx = hash.slice(32, 64); // Server rx = client tx (last 32 bytes)
-  const sharedTx = hash.slice(0, 32); // Server tx = client rx (first 32 bytes)
+  const sharedRx = hash.slice(crypto_kx_SESSIONKEYBYTES, 2 * crypto_kx_SESSIONKEYBYTES); // Server rx = client tx (last 32 bytes)
+  const sharedTx = hash.slice(0, crypto_kx_SESSIONKEYBYTES); // Server tx = client rx (first 32 bytes)
 
   return {
     sharedRx: sharedRx,
@@ -336,6 +392,7 @@ export function crypto_secretbox_easy(
   key: Uint8Array
 ): Uint8Array {
   // Encrypt the message using XSalsa20Poly1305
+  // crypto_secretbox_MESSAGEBYTES_MAX is not enforced here, as noble-ciphers can handle larger messages
   const encrypted = xsalsa20poly1305(key, nonce).encrypt(message);
 
   return encrypted;
